@@ -1,0 +1,438 @@
+import telebot
+from telebot import types
+import sqlite3
+from datetime import datetime, timedelta, timezone
+import time
+import threading
+from urllib.parse import quote
+from urllib.request import urlopen
+import io
+
+# ================= CONFIGURATION =================
+TOKEN = "9287947046:AAENaDicg5ob9SQEcEg6-V5qqMLeo-IpZFM"
+ADMIN_ID = 8307202156  #[span_0](start_span)[span_0](end_span)
+PRIVATE_CHANNEL_ID = -1004448221220  # Apne Private Channel ka numeric ID yahan dalein (e.g. -1001234567890)
+PRIVATE_CHANNEL_LINK = "https://t.me/+ZyFqqV6cgUhjYzE1"  #[span_1](start_span)[span_1](end_span)
+UPI_ID = "Paytm.s2b9rko@pty"  #[span_2](start_span)[span_2](end_span)
+MERCHANT_NAME = "VIP Access"
+
+bot = telebot.TeleBot(TOKEN)
+IST = timezone(timedelta(hours=5, minutes=30))
+DB_NAME = 'bot_users_v2.db'
+
+def safe_answer(call_id, text=None, show_alert=False):
+    try:
+        bot.answer_callback_query(call_id, text=text, show_alert=show_alert)
+    except Exception:
+        pass
+
+# Helper function: Unban user & get fresh rejoin link
+def unban_and_get_link(user_id):
+    try:
+        bot.unban_chat_member(PRIVATE_CHANNEL_ID, user_id, only_if_banned=True)
+    except Exception as e:
+        print(f"Unban info: {e}")
+
+    # Koshish karega naya 1-user invite link banane ki, warna default link dega
+    try:
+        invite = bot.create_chat_invite_link(
+            PRIVATE_CHANNEL_ID,
+            member_limit=1,
+            name=f"Paid_{user_id}"
+        )
+        return invite.invite_link
+    except Exception:
+        return PRIVATE_CHANNEL_LINK
+
+# ================= QR CODE GENERATOR HELPER =================
+def send_upi_qr(chat_id, amount, plan_title):
+    upi_uri = f"upi://pay?pa={UPI_ID}&pn={quote(MERCHANT_NAME)}&am={amount}&cu=INR"
+    qr_image_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=10&data={quote(upi_uri)}"
+
+    caption = (
+        f"💳 *{plan_title}*\n\n"
+        f"💰 *Amount to Pay:* ₹{amount}\n"
+        f"🏦 *UPI ID:* `{UPI_ID}`\n\n"
+        "📲 *How to Pay:*\n"
+        "1. Upar diye gaye QR Code ko kisi bhi UPI App (PhonePe, GPay, Paytm) se scan karein.\n"
+        "2. Payment complete hone ke baad niche *📸 Send Payment Screenshot* button dabayein aur apna **Screenshot** bhej dein."
+    )
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    btn_ss = types.InlineKeyboardButton("📸 Send Payment Screenshot", callback_data=f"send_ss_{amount}")
+    btn_back = types.InlineKeyboardButton("🔙 Back to Plans", callback_data="view_plans")
+    markup.add(btn_ss, btn_back)
+
+    try:
+        img_bytes = io.BytesIO(urlopen(qr_image_url, timeout=10).read())
+        img_bytes.name = 'qr.png'
+        bot.send_photo(chat_id, img_bytes, caption=caption, reply_markup=markup, parse_mode="Markdown")
+    except Exception as e:
+        print(f"QR Send Error: {e}")
+        bot.send_message(chat_id, caption, reply_markup=markup, parse_mode="Markdown")
+
+# ================= DATABASE SETUP =================
+def init_db():
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            name TEXT,
+            plan TEXT,
+            status TEXT,
+            expiry_date TEXT,
+            raw_expiry REAL,
+            trial_used INTEGER DEFAULT 0
+        )
+    ''')
+    existing_cols = [col[1] for col in cursor.execute("PRAGMA table_info(users)").fetchall()]
+    for col in ['username', 'name', 'plan', 'status', 'expiry_date', 'raw_expiry', 'trial_used']:
+        if col not in existing_cols:
+            cursor.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
+            
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def get_user(user_id):
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id, username, name, plan, status, expiry_date, raw_expiry, trial_used FROM users WHERE user_id = ?', (user_id,))
+    user = cursor.fetchone()
+    conn.close()
+    return user
+
+def update_user(user_id, username, name, plan, status, expiry_date, raw_expiry, trial_used=1):
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO users (user_id, username, name, plan, status, expiry_date, raw_expiry, trial_used)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (user_id, username, name, plan, status, expiry_date, raw_expiry, trial_used))
+    conn.commit()
+    conn.close()
+
+# ================= AUTO-BAN BACKGROUND WORKER =================
+def expiry_checker():
+    while True:
+        try:
+            now_ts = datetime.now(IST).timestamp()
+            conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id FROM users WHERE CAST(raw_expiry AS REAL) > 0 AND CAST(raw_expiry AS REAL) <= ? AND status != '❌ Expired (Banned)'", (now_ts,))
+            expired_users = cursor.fetchall()
+
+            for row in expired_users:
+                u_id = row[0]
+                cursor.execute("UPDATE users SET status = '❌ Expired (Banned)', plan = 'Expired' WHERE user_id = ?", (u_id,))
+                conn.commit()
+
+                try:
+                    bot.ban_chat_member(PRIVATE_CHANNEL_ID, u_id)
+                except Exception as e:
+                    print(f"Channel Ban error: {e}")
+
+                try:
+                    markup = types.InlineKeyboardMarkup()
+                    markup.add(types.InlineKeyboardButton("💳 Buy Paid Plan to Rejoin", callback_data="view_plans"))
+                    bot.send_message(
+                        u_id,
+                        "🚫 *Access Expired & Locked!*\n\n"
+                        "Aapka free trial/plan samapt ho chuka hai aur aapko channel se remove/ban kar diya gaya hai.\n\n"
+                        "Dobara unban hone aur channel rejoin karne ke liye Paid Plan purchase karein!",
+                        reply_markup=markup,
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    print(f"DM error for user {u_id}: {e}")
+
+            conn.close()
+        except Exception as err:
+            print(f"Background worker error: {err}")
+        
+        time.sleep(20)
+
+threading.Thread(target=expiry_checker, daemon=True).start()
+
+# ================= START COMMAND =================
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    user_id = message.from_user.id
+    username = f"@{message.from_user.username}" if message.from_user.username else "No Username"
+    name = message.from_user.first_name or "User"
+
+    user = get_user(user_id)
+    if not user:
+        update_user(user_id, username, name, "None", "Inactive", "N/A", 0.0, 0)
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    btn_demo = types.InlineKeyboardButton("Demo", callback_data="demo")
+    btn_plans = types.InlineKeyboardButton("💳 View Paid Plans", callback_data="view_plans")
+    btn_account = types.InlineKeyboardButton("📊 My Account", callback_data="my_account")
+    btn_support = types.InlineKeyboardButton("🆘 Contact Support", callback_data="support")
+    markup.add(btn_demo, btn_plans, btn_account, btn_support)
+
+    text = (
+        "1 Lakh+ Viral Videos\n\n"
+        "🔥 FREE ACCESS 🔥\n\n"
+        "Get free access to our collection of 1 Lakh+ viral videos during the trial period. "
+        "After the trial ends, choose a paid plan to continue your access.\n\n"
+        "💳 PAID PLANS\n"
+        "• 30 Days – ₹299\n"
+        "• Lifetime – ₹499\n\n"
+        "👇 Choose your plan below to continue!"
+    )
+
+    bot.send_message(message.chat.id, text, reply_markup=markup)
+
+# ================= CALLBACK HANDLERS =================
+@bot.callback_query_handler(func=lambda call: True)
+def callback_query(call):
+    user_id = call.from_user.id
+    username = f"@{call.from_user.username}" if call.from_user.username else "No Username"
+    name = call.from_user.first_name or "User"
+    user = get_user(user_id)
+
+    # 1. DEMO / FREE TRIAL BUTTON
+    if call.data == "demo":
+        if user and str(user[7]) == "1":
+            safe_answer(call.id, "⚠️ Aap apna Free Trial pehle hi use kar chuke hain! Kripya Paid Plan chunein.", show_alert=True)
+            return
+
+        safe_answer(call.id, "Free Trial Activated!")
+        now = datetime.now(IST)
+        expiry_dt = now + timedelta(minutes=2)
+        raw_expiry = expiry_dt.timestamp()
+        expiry_str = expiry_dt.strftime("%d %b %Y, %I:%M %p IST")
+
+        update_user(user_id, username, name, "Free Trial", "🆕 Free trial", expiry_str, raw_expiry, 1)
+
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        btn_join = types.InlineKeyboardButton("🎬 Join Private Channel", url=PRIVATE_CHANNEL_LINK)
+        btn_account = types.InlineKeyboardButton("📊 My Account", callback_data="my_account")
+        btn_renew = types.InlineKeyboardButton("💳 Renew Plan", callback_data="view_plans")
+        btn_support = types.InlineKeyboardButton("🆘 Contact Support", callback_data="support")
+        markup.add(btn_join, btn_account, btn_renew, btn_support)
+
+        text = (
+            f"✅ Your free access is active until: {expiry_str}\n\n"
+            "Tap the button below to enter the private channel."
+        )
+        bot.send_message(call.message.chat.id, text, reply_markup=markup)
+
+    # 2. VIEW PAID PLANS / RENEW PLAN
+    elif call.data == "view_plans":
+        safe_answer(call.id)
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        btn_30 = types.InlineKeyboardButton("30 Days – ₹299 (Get QR)", callback_data="plan_299")
+        btn_life = types.InlineKeyboardButton("Lifetime – ₹499 (Get QR)", callback_data="plan_499")
+        btn_support = types.InlineKeyboardButton("🆘 Contact Support", callback_data="support")
+        markup.add(btn_30, btn_life, btn_support)
+
+        text = (
+            "💳 *Paid Plans*\n\n"
+            "Apna plan select karein, aapko turant Scan & Pay QR Code mil jayega:"
+        )
+        bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
+
+    # 3. PLAN 299 DETAILS WITH QR CODE
+    elif call.data == "plan_299":
+        safe_answer(call.id, "Generating ₹299 QR Code...")
+        send_upi_qr(call.message.chat.id, 299, "30 Days Plan – ₹299")
+
+    # 4. PLAN 499 DETAILS WITH QR CODE
+    elif call.data == "plan_499":
+        safe_answer(call.id, "Generating ₹499 QR Code...")
+        send_upi_qr(call.message.chat.id, 499, "Lifetime Plan – ₹499")
+
+    # 5. MY ACCOUNT
+    elif call.data == "my_account":
+        safe_answer(call.id)
+        if user and user[3] != "None":
+            plan = user[3]
+            status = user[4]
+            expiry = user[5]
+        else:
+            plan = "No Active Plan"
+            status = "❌ Inactive"
+            expiry = "N/A"
+
+        text = (
+            "📊 *My Account*\n\n"
+            f"Name: {name}\n"
+            f"Username: {username}\n"
+            f"Telegram ID: `{user_id}`\n"
+            f"Current plan: {plan}\n"
+            f"Status: {status}\n"
+            f"Expiry date: {expiry}"
+        )
+
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        btn_renew = types.InlineKeyboardButton("💳 Renew Plan", callback_data="view_plans")
+        btn_support = types.InlineKeyboardButton("🆘 Contact Support", callback_data="support")
+        markup.add(btn_renew, btn_support)
+
+        bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
+
+    # 6. CONTACT SUPPORT MENU
+    elif call.data == "support":
+        safe_answer(call.id)
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        btn_send_msg = types.InlineKeyboardButton("📸 Send Payment Screenshot / Support", callback_data="send_support")
+        btn_account = types.InlineKeyboardButton("📊 My Account", callback_data="my_account")
+        btn_plans = types.InlineKeyboardButton("💳 View Paid Plans", callback_data="view_plans")
+        markup.add(btn_send_msg, btn_account, btn_plans)
+
+        text = (
+            "🆘 *Support & Payment Verification*\n\n"
+            "Payment screenshot ya apna message bhejne ke liye niche button par click karein."
+        )
+        bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
+
+    # 7. SEND SUPPORT / SCREENSHOT STEP
+    elif call.data == "send_support" or call.data.startswith("send_ss_"):
+        safe_answer(call.id)
+        selected_amt = call.data.split("_")[-1] if call.data.startswith("send_ss_") else "Support"
+        msg = bot.send_message(
+            call.message.chat.id,
+            "📸 *Send your Payment Screenshot now* (or send your support message). Use /cancel to exit.",
+            parse_mode="Markdown"
+        )
+        bot.register_next_step_handler(msg, process_support_message, selected_amt)
+
+    # ================= 8. ADMIN APPROVE / REJECT BUTTON HANDLER =================
+    elif call.data.startswith("adm_"):
+        if user_id != ADMIN_ID:
+            safe_answer(call.id, "⛔ Only Admin can use this button!", show_alert=True)
+            return
+
+        parts = call.data.split("_")
+        action = parts[1]       # app30, applife, ya reject
+        target_id = int(parts[2])
+
+        u_data = get_user(target_id)
+        u_name = u_data[1] if u_data else "No Username"
+        f_name = u_data[2] if u_data else "User"
+
+        # A) ADMIN APPROVES 30 DAYS OR LIFETIME
+        if action in ["app30", "applife"]:
+            now = datetime.now(IST)
+            if action == "app30":
+                expiry_dt = now + timedelta(days=30)
+                raw_exp = expiry_dt.timestamp()
+                exp_str = expiry_dt.strftime("%d %b %Y, %I:%M %p IST")
+                p_name = "30 Days – ₹299"
+            else:
+                expiry_dt = now + timedelta(days=36500)
+                raw_exp = expiry_dt.timestamp()
+                exp_str = "Lifetime"
+                p_name = "Lifetime – ₹499"
+
+            # 1. Unban user & get rejoin link
+            rejoin_link = unban_and_get_link(target_id)
+
+            # 2. Update database
+            update_user(target_id, u_name, f_name, p_name, "✅ Active", exp_str, raw_exp, 1)
+
+            # 3. Send Rejoin Link to User
+            user_markup = types.InlineKeyboardMarkup(row_width=1)
+            user_markup.add(
+                types.InlineKeyboardButton("🎬 Rejoin Private Channel Now", url=rejoin_link),
+                types.InlineKeyboardButton("📊 My Account", callback_data="my_account")
+            )
+            try:
+                bot.send_message(
+                    target_id,
+                    f"🎉 *Payment Approved!*\n\n"
+                    f"✅ *Plan Activated:* {p_name}\n"
+                    f"⏳ *Valid Until:* {exp_str}\n\n"
+                    "Aapko channel se unban kar diya gaya hai! Niche diye gaye button par click karke channel rejoin karein:",
+                    reply_markup=user_markup,
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                print(f"Error sending approval to user: {e}")
+
+            safe_answer(call.id, f"✅ Approved {p_name}!")
+            bot.edit_message_text(
+                f"{call.message.text}\n\n✅ *STATUS: APPROVED ({p_name})*",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="Markdown"
+            )
+
+        # B) ADMIN REJECTS PAYMENT
+        elif action == "reject":
+            user_markup = types.InlineKeyboardMarkup(row_width=1)
+            user_markup.add(
+                types.InlineKeyboardButton("💳 View Paid Plans & Try Again", callback_data="view_plans"),
+                types.InlineKeyboardButton("📸 Resend Valid Screenshot", callback_data="send_support")
+            )
+            try:
+                bot.send_message(
+                    target_id,
+                    "❌ *Payment Screenshot Rejected!*\n\n"
+                    "Admin ne aapka payment verify nahi paaya (invalid screenshot ya payment प्राप्त nahi hua).\n\n"
+                    "Kripya sahi payment screenshot dobara bhejein.",
+                    reply_markup=user_markup,
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                print(f"Error sending rejection to user: {e}")
+
+            safe_answer(call.id, "❌ Request Rejected!")
+            bot.edit_message_text(
+                f"{call.message.text}\n\n❌ *STATUS: REJECTED BY ADMIN*",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="Markdown"
+            )
+
+# ================= SUPPORT / SCREENSHOT FORWARDING TO ADMIN =================
+def process_support_message(message, selected_amt="Support"):
+    if message.text and message.text.strip() == "/cancel":
+        bot.send_message(message.chat.id, "❌ Request cancelled.")
+        return
+
+    uid = message.from_user.id
+    uname = f"@{message.from_user.username}" if message.from_user.username else "No Username"
+    fname = message.from_user.first_name or "User"
+
+    plan_hint = f"₹{selected_amt} Plan" if selected_amt in ["299", "499"] else "Support / Payment Proof"
+
+    # Admin ke liye Inline Approve / Reject Buttons
+    admin_markup = types.InlineKeyboardMarkup(row_width=2)
+    btn_app30 = types.InlineKeyboardButton("✅ Approve 30d (₹299)", callback_data=f"adm_app30_{uid}")
+    btn_applife = types.InlineKeyboardButton("✅ Approve Life (₹499)", callback_data=f"adm_applife_{uid}")
+    btn_reject = types.InlineKeyboardButton("❌ Reject Screenshot", callback_data=f"adm_reject_{uid}")
+    admin_markup.add(btn_app30, btn_applife)
+    admin_markup.add(btn_reject)
+
+    user_info = (
+        f"📩 *New {plan_hint} Received*\n"
+        f"👤 *From:* {fname} ({uname})\n"
+        f"🆔 *User ID:* `{uid}`\n\n"
+        "👇 *Niche screenshot check karke Approve ya Reject dabayein:*"
+    )
+
+    try:
+        # Pehle user ka screenshot/message Admin ko forward karo
+        bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
+        # Uske niche Admin Control Panel (Approve / Reject buttons) bhejo
+        bot.send_message(ADMIN_ID, user_info, reply_markup=admin_markup, parse_mode="Markdown")
+    except Exception as e:
+        print(f"Error forwarding to admin: {e}")
+
+    bot.send_message(
+        message.chat.id,
+        "⏳ *Screenshot Submitted!*\n\nAapka payment screenshot Admin ko verification ke liye bhej diya gaya hai. Approve hote hi aapko yahan **Channel Rejoin Link** mil jayega!",
+        parse_mode="Markdown"
+    )
+
+# ================= RUN BOT =================
+if __name__ == "__main__":
+    print("Bot is running with Admin Approve/Reject Buttons & Auto-Rejoin Link...")
+    bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=10)
