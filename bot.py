@@ -7,13 +7,30 @@ import threading
 from urllib.parse import quote
 from urllib.request import urlopen
 import io
+import os
+from flask import Flask
+
+# ================= RENDER KEEP-ALIVE WEB SERVER =================
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is active and running 24/7!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = threading.Thread(target=run_flask)
+    t.start()
 
 # ================= CONFIGURATION =================
 TOKEN = "9287947046:AAENaDicg5ob9SQEcEg6-V5qqMLeo-IpZFM"
-ADMIN_ID = 8307202156  #[span_0](start_span)[span_0](end_span)
-PRIVATE_CHANNEL_ID = -1004448221220  # Apne Private Channel ka numeric ID yahan dalein (e.g. -1001234567890)
-PRIVATE_CHANNEL_LINK = "https://t.me/+ZyFqqV6cgUhjYzE1"  #[span_1](start_span)[span_1](end_span)
-UPI_ID = "Paytm.s2b9rko@pty"  #[span_2](start_span)[span_2](end_span)
+ADMIN_ID = 8307202156  #[span_2](start_span)[span_2](end_span)
+PRIVATE_CHANNEL_ID = -1004448221220  # Apne Private Channel ka numeric ID yahan dalein
+PRIVATE_CHANNEL_LINK = "https://t.me/+ZyFqqV6cgUhjYzE1"  #[span_3](start_span)[span_3](end_span)
+UPI_ID = "Paytm.s2b9rko@pty"  #[span_4](start_span)[span_4](end_span)
 MERCHANT_NAME = "VIP Access"
 
 bot = telebot.TeleBot(TOKEN)
@@ -26,14 +43,12 @@ def safe_answer(call_id, text=None, show_alert=False):
     except Exception:
         pass
 
-# Helper function: Unban user & get fresh rejoin link
 def unban_and_get_link(user_id):
     try:
         bot.unban_chat_member(PRIVATE_CHANNEL_ID, user_id, only_if_banned=True)
     except Exception as e:
         print(f"Unban info: {e}")
 
-    # Koshish karega naya 1-user invite link banane ki, warna default link dega
     try:
         invite = bot.create_chat_invite_link(
             PRIVATE_CHANNEL_ID,
@@ -196,7 +211,6 @@ def callback_query(call):
     name = call.from_user.first_name or "User"
     user = get_user(user_id)
 
-    # 1. DEMO / FREE TRIAL BUTTON
     if call.data == "demo":
         if user and str(user[7]) == "1":
             safe_answer(call.id, "⚠️ Aap apna Free Trial pehle hi use kar chuke hain! Kripya Paid Plan chunein.", show_alert=True)
@@ -221,9 +235,8 @@ def callback_query(call):
             f"✅ Your free access is active until: {expiry_str}\n\n"
             "Tap the button below to enter the private channel."
         )
-        bot.send_message(call.message.chat.id, text, reply_markup=markup)
+        bot.send_message(message.chat.id, text, reply_markup=markup)
 
-    # 2. VIEW PAID PLANS / RENEW PLAN
     elif call.data == "view_plans":
         safe_answer(call.id)
         markup = types.InlineKeyboardMarkup(row_width=1)
@@ -238,17 +251,14 @@ def callback_query(call):
         )
         bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
 
-    # 3. PLAN 299 DETAILS WITH QR CODE
     elif call.data == "plan_299":
         safe_answer(call.id, "Generating ₹299 QR Code...")
         send_upi_qr(call.message.chat.id, 299, "30 Days Plan – ₹299")
 
-    # 4. PLAN 499 DETAILS WITH QR CODE
     elif call.data == "plan_499":
         safe_answer(call.id, "Generating ₹499 QR Code...")
         send_upi_qr(call.message.chat.id, 499, "Lifetime Plan – ₹499")
 
-    # 5. MY ACCOUNT
     elif call.data == "my_account":
         safe_answer(call.id)
         if user and user[3] != "None":
@@ -277,7 +287,6 @@ def callback_query(call):
 
         bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
 
-    # 6. CONTACT SUPPORT MENU
     elif call.data == "support":
         safe_answer(call.id)
         markup = types.InlineKeyboardMarkup(row_width=1)
@@ -292,7 +301,6 @@ def callback_query(call):
         )
         bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
 
-    # 7. SEND SUPPORT / SCREENSHOT STEP
     elif call.data == "send_support" or call.data.startswith("send_ss_"):
         safe_answer(call.id)
         selected_amt = call.data.split("_")[-1] if call.data.startswith("send_ss_") else "Support"
@@ -303,21 +311,19 @@ def callback_query(call):
         )
         bot.register_next_step_handler(msg, process_support_message, selected_amt)
 
-    # ================= 8. ADMIN APPROVE / REJECT BUTTON HANDLER =================
     elif call.data.startswith("adm_"):
         if user_id != ADMIN_ID:
             safe_answer(call.id, "⛔ Only Admin can use this button!", show_alert=True)
             return
 
         parts = call.data.split("_")
-        action = parts[1]       # app30, applife, ya reject
+        action = parts[1]
         target_id = int(parts[2])
 
         u_data = get_user(target_id)
         u_name = u_data[1] if u_data else "No Username"
         f_name = u_data[2] if u_data else "User"
 
-        # A) ADMIN APPROVES 30 DAYS OR LIFETIME
         if action in ["app30", "applife"]:
             now = datetime.now(IST)
             if action == "app30":
@@ -331,13 +337,9 @@ def callback_query(call):
                 exp_str = "Lifetime"
                 p_name = "Lifetime – ₹499"
 
-            # 1. Unban user & get rejoin link
             rejoin_link = unban_and_get_link(target_id)
-
-            # 2. Update database
             update_user(target_id, u_name, f_name, p_name, "✅ Active", exp_str, raw_exp, 1)
 
-            # 3. Send Rejoin Link to User
             user_markup = types.InlineKeyboardMarkup(row_width=1)
             user_markup.add(
                 types.InlineKeyboardButton("🎬 Rejoin Private Channel Now", url=rejoin_link),
@@ -364,7 +366,6 @@ def callback_query(call):
                 parse_mode="Markdown"
             )
 
-        # B) ADMIN REJECTS PAYMENT
         elif action == "reject":
             user_markup = types.InlineKeyboardMarkup(row_width=1)
             user_markup.add(
@@ -375,8 +376,7 @@ def callback_query(call):
                 bot.send_message(
                     target_id,
                     "❌ *Payment Screenshot Rejected!*\n\n"
-                    "Admin ne aapka payment verify nahi paaya (invalid screenshot ya payment प्राप्त nahi hua).\n\n"
-                    "Kripya sahi payment screenshot dobara bhejein.",
+                    "Admin ne aapka payment verify nahi paaya. Kripya sahi payment screenshot dobara bhejein.",
                     reply_markup=user_markup,
                     parse_mode="Markdown"
                 )
@@ -391,7 +391,6 @@ def callback_query(call):
                 parse_mode="Markdown"
             )
 
-# ================= SUPPORT / SCREENSHOT FORWARDING TO ADMIN =================
 def process_support_message(message, selected_amt="Support"):
     if message.text and message.text.strip() == "/cancel":
         bot.send_message(message.chat.id, "❌ Request cancelled.")
@@ -403,7 +402,6 @@ def process_support_message(message, selected_amt="Support"):
 
     plan_hint = f"₹{selected_amt} Plan" if selected_amt in ["299", "499"] else "Support / Payment Proof"
 
-    # Admin ke liye Inline Approve / Reject Buttons
     admin_markup = types.InlineKeyboardMarkup(row_width=2)
     btn_app30 = types.InlineKeyboardButton("✅ Approve 30d (₹299)", callback_data=f"adm_app30_{uid}")
     btn_applife = types.InlineKeyboardButton("✅ Approve Life (₹499)", callback_data=f"adm_applife_{uid}")
@@ -419,9 +417,7 @@ def process_support_message(message, selected_amt="Support"):
     )
 
     try:
-        # Pehle user ka screenshot/message Admin ko forward karo
         bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
-        # Uske niche Admin Control Panel (Approve / Reject buttons) bhejo
         bot.send_message(ADMIN_ID, user_info, reply_markup=admin_markup, parse_mode="Markdown")
     except Exception as e:
         print(f"Error forwarding to admin: {e}")
@@ -432,7 +428,8 @@ def process_support_message(message, selected_amt="Support"):
         parse_mode="Markdown"
     )
 
-# ================= RUN BOT =================
+# ================= RUN BOT & KEEP-ALIVE =================
 if __name__ == "__main__":
-    print("Bot is running with Admin Approve/Reject Buttons & Auto-Rejoin Link...")
+    keep_alive()  # Flask server starts in background thread to satisfy Render port binding
+    print("Bot is running smoothly with Flask Keep-Alive & Auto-Ban...")
     bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=10)
