@@ -35,8 +35,7 @@ MERCHANT_NAME = "VIP Access"
 
 bot = telebot.TeleBot(TOKEN)
 IST = timezone(timedelta(hours=5, minutes=30))
-# Naya DB naam taaki purane locked users fresh start kar sakein
-DB_NAME = 'bot_users_v3.db'
+DB_NAME = 'bot_users_v4.db'
 
 def safe_answer(call_id, text=None, show_alert=False):
     try:
@@ -45,11 +44,13 @@ def safe_answer(call_id, text=None, show_alert=False):
         pass
 
 def unban_and_get_link(user_id):
+    # User ko channel se unban karo taaki wo join kar sake
     try:
         bot.unban_chat_member(PRIVATE_CHANNEL_ID, user_id, only_if_banned=True)
     except Exception as e:
-        print(f"Unban info: {e}")
+        print(f"Unban info for {user_id}: {e}")
 
+    # Naya invite link banane ki koshish karo, warna default link bhejo
     try:
         invite = bot.create_chat_invite_link(
             PRIVATE_CHANNEL_ID,
@@ -168,22 +169,58 @@ def expiry_checker():
 
 threading.Thread(target=expiry_checker, daemon=True).start()
 
-# ================= ADMIN COMMAND: RESET TRIAL FOR TESTING =================
-# Usage: /reset (khud ka trial reset karne ke liye) ya /reset USER_ID
-@bot.message_handler(commands=['reset'])
+# ================= ADMIN COMMAND: RESET ALL USERS OR SINGLE USER =================
+# Usage:
+# /reset          -> Sabhi users ka Free Trial reset karega aur unban karega!
+# /resetall       -> Sabhi users ka Free Trial reset karega aur unban karega!
+# /reset 12345678 -> Sirf ek specific user_id ka trial reset karega!
+@bot.message_handler(commands=['reset', 'resetall'])
 def reset_trial_cmd(message):
     if message.from_user.id != ADMIN_ID:
         return
+
     parts = message.text.split()
-    target_id = int(parts[1]) if len(parts) > 1 else message.from_user.id
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    cursor = conn.cursor()
 
-    try:
-        bot.unban_chat_member(PRIVATE_CHANNEL_ID, target_id, only_if_banned=True)
-    except Exception:
-        pass
+    # Agar kisi 1 user ki ID di hai (/reset 123456789)
+    if len(parts) > 1 and parts[1].isdigit():
+        target_id = int(parts[1])
+        try:
+            bot.unban_chat_member(PRIVATE_CHANNEL_ID, target_id, only_if_banned=True)
+        except Exception:
+            pass
+        cursor.execute("UPDATE users SET plan='None', status='Inactive', expiry_date='N/A', raw_expiry=0, trial_used=0 WHERE user_id=?", (target_id,))
+        conn.commit()
+        conn.close()
+        bot.reply_to(message, f"✅ User `{target_id}` ka Free Trial reset aur unban ho gaya hai!", parse_mode="Markdown")
+        return
 
-    update_user(target_id, "User", "User", "None", "Inactive", "N/A", 0.0, 0)
-    bot.reply_to(message, f"✅ User `{target_id}` ka Free Trial reset ho gaya hai! Ab wo dobara Demo button use kar sakta hai.", parse_mode="Markdown")
+    # Agar sirf /reset ya /resetall bheja hai -> SABHI USERS KO RESET KARO
+    cursor.execute("SELECT user_id FROM users")
+    all_users = cursor.fetchall()
+
+    # Database me sabhi users ka trial_used = 0 kar do
+    cursor.execute("UPDATE users SET plan='None', status='Inactive', expiry_date='N/A', raw_expiry=0, trial_used=0")
+    conn.commit()
+    conn.close()
+
+    # Channel se sabhi purane banned users ko unban bhi kar do
+    unbanned_count = 0
+    for r in all_users:
+        try:
+            bot.unban_chat_member(PRIVATE_CHANNEL_ID, r[0], only_if_banned=True)
+            unbanned_count += 1
+        except Exception:
+            pass
+
+    bot.reply_to(
+        message,
+        f"✅ *ALL USERS RESET SUCCESSFUL!*\n\n"
+        f"Total `{len(all_users)}` users ka Free Trial reset kar diya gaya hai aur channel se unban kar diya gaya hai.\n"
+        "Ab har user **Demo** button daba kar naya Free Trial link le sakta hai!",
+        parse_mode="Markdown"
+    )
 
 # ================= START COMMAND =================
 @bot.message_handler(commands=['start'])
@@ -193,7 +230,6 @@ def send_welcome(message):
     name = message.from_user.first_name or "User"
 
     user = get_user(user_id)
-    # Agar bilkul naya user hai toh trial_used = 0 ke saath save karo
     if not user:
         update_user(user_id, username, name, "None", "Inactive", "N/A", 0.0, 0)
 
@@ -225,9 +261,8 @@ def callback_query(call):
     name = call.from_user.first_name or "User"
     user = get_user(user_id)
 
-    # 1. DEMO / FREE TRIAL BUTTON (Fixed for First-Time Users!)
+    # 1. DEMO / FREE TRIAL BUTTON
     if call.data == "demo":
-        # Check if user has genuinely used trial before (trial_used == 1)
         already_used = False
         if user is not None:
             try:
@@ -240,18 +275,20 @@ def callback_query(call):
             safe_answer(call.id, "⚠️ Aap apna Free Trial pehle hi le chuke hain! Kripya Paid Plan chunein.", show_alert=True)
             return
 
-        # First time user: Give Demo Link Immediately!
         safe_answer(call.id, "🎉 Free Trial Activated!")
         now = datetime.now(IST)
         expiry_dt = now + timedelta(minutes=2)
         raw_expiry = expiry_dt.timestamp()
         expiry_str = expiry_dt.strftime("%d %b %Y, %I:%M %p IST")
 
-        # Save user with trial_used = 1 so they can't take it a second time
+        # User ko channel se unban karo (agar pehle ban hua tha) aur link do
+        demo_link = unban_and_get_link(user_id)
+
+        # Save user with trial_used = 1
         update_user(user_id, username, name, "Free Trial", "🆕 Free trial", expiry_str, raw_expiry, 1)
 
         markup = types.InlineKeyboardMarkup(row_width=1)
-        btn_join = types.InlineKeyboardButton("🎬 Join Private Channel", url=PRIVATE_CHANNEL_LINK)
+        btn_join = types.InlineKeyboardButton("🎬 Join Private Channel", url=demo_link)
         btn_account = types.InlineKeyboardButton("📊 My Account", callback_data="my_account")
         btn_renew = types.InlineKeyboardButton("💳 Renew Plan", callback_data="view_plans")
         btn_support = types.InlineKeyboardButton("🆘 Contact Support", callback_data="support")
@@ -464,5 +501,5 @@ def process_support_message(message, selected_amt="Support"):
 # ================= RUN BOT & KEEP-ALIVE =================
 if __name__ == "__main__":
     keep_alive()
-    print("Bot is running with Fixed First-Time Demo Link...")
+    print("Bot is running with /resetall & Auto-Unban on Demo...")
     bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=10)
