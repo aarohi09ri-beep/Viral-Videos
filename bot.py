@@ -22,20 +22,21 @@ def run_flask():
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
-    t = threading.Thread(target=run_flask)
+    t = threading.Thread(target=run_flask, daemon=True)
     t.start()
 
 # ================= CONFIGURATION =================
 TOKEN = "9287947046:AAENaDicg5ob9SQEcEg6-V5qqMLeo-IpZFM"
-ADMIN_ID = 8307202156  #[span_2](start_span)[span_2](end_span)
+ADMIN_ID = 8307202156  #[span_0](start_span)[span_0](end_span)
 PRIVATE_CHANNEL_ID = -1004448221220  # Apne Private Channel ka numeric ID yahan dalein
-PRIVATE_CHANNEL_LINK = "https://t.me/+ZyFqqV6cgUhjYzE1"  #[span_3](start_span)[span_3](end_span)
-UPI_ID = "Paytm.s2b9rko@pty"  #[span_4](start_span)[span_4](end_span)
+PRIVATE_CHANNEL_LINK = "https://t.me/+ZyFqqV6cgUhjYzE1"  #[span_1](start_span)[span_1](end_span)
+UPI_ID = "Paytm.s2b9rko@pty"  #[span_2](start_span)[span_2](end_span)
 MERCHANT_NAME = "VIP Access"
 
 bot = telebot.TeleBot(TOKEN)
 IST = timezone(timedelta(hours=5, minutes=30))
-DB_NAME = 'bot_users_v2.db'
+# Naya DB naam taaki purane locked users fresh start kar sakein
+DB_NAME = 'bot_users_v3.db'
 
 def safe_answer(call_id, text=None, show_alert=False):
     try:
@@ -53,7 +54,7 @@ def unban_and_get_link(user_id):
         invite = bot.create_chat_invite_link(
             PRIVATE_CHANNEL_ID,
             member_limit=1,
-            name=f"Paid_{user_id}"
+            name=f"User_{user_id}"
         )
         return invite.invite_link
     except Exception:
@@ -98,15 +99,10 @@ def init_db():
             plan TEXT,
             status TEXT,
             expiry_date TEXT,
-            raw_expiry REAL,
+            raw_expiry REAL DEFAULT 0,
             trial_used INTEGER DEFAULT 0
         )
     ''')
-    existing_cols = [col[1] for col in cursor.execute("PRAGMA table_info(users)").fetchall()]
-    for col in ['username', 'name', 'plan', 'status', 'expiry_date', 'raw_expiry', 'trial_used']:
-        if col not in existing_cols:
-            cursor.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
-            
     conn.commit()
     conn.close()
 
@@ -120,13 +116,13 @@ def get_user(user_id):
     conn.close()
     return user
 
-def update_user(user_id, username, name, plan, status, expiry_date, raw_expiry, trial_used=1):
+def update_user(user_id, username, name, plan, status, expiry_date, raw_expiry=0.0, trial_used=0):
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('''
         INSERT OR REPLACE INTO users (user_id, username, name, plan, status, expiry_date, raw_expiry, trial_used)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (user_id, username, name, plan, status, expiry_date, raw_expiry, trial_used))
+    ''', (user_id, username, name, plan, status, expiry_date, float(raw_expiry), int(trial_used)))
     conn.commit()
     conn.close()
 
@@ -137,7 +133,7 @@ def expiry_checker():
             now_ts = datetime.now(IST).timestamp()
             conn = sqlite3.connect(DB_NAME, check_same_thread=False)
             cursor = conn.cursor()
-            cursor.execute("SELECT user_id FROM users WHERE CAST(raw_expiry AS REAL) > 0 AND CAST(raw_expiry AS REAL) <= ? AND status != '❌ Expired (Banned)'", (now_ts,))
+            cursor.execute("SELECT user_id FROM users WHERE raw_expiry > 0 AND raw_expiry <= ? AND status != '❌ Expired (Banned)'", (now_ts,))
             expired_users = cursor.fetchall()
 
             for row in expired_users:
@@ -172,6 +168,23 @@ def expiry_checker():
 
 threading.Thread(target=expiry_checker, daemon=True).start()
 
+# ================= ADMIN COMMAND: RESET TRIAL FOR TESTING =================
+# Usage: /reset (khud ka trial reset karne ke liye) ya /reset USER_ID
+@bot.message_handler(commands=['reset'])
+def reset_trial_cmd(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split()
+    target_id = int(parts[1]) if len(parts) > 1 else message.from_user.id
+
+    try:
+        bot.unban_chat_member(PRIVATE_CHANNEL_ID, target_id, only_if_banned=True)
+    except Exception:
+        pass
+
+    update_user(target_id, "User", "User", "None", "Inactive", "N/A", 0.0, 0)
+    bot.reply_to(message, f"✅ User `{target_id}` ka Free Trial reset ho gaya hai! Ab wo dobara Demo button use kar sakta hai.", parse_mode="Markdown")
+
 # ================= START COMMAND =================
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -180,6 +193,7 @@ def send_welcome(message):
     name = message.from_user.first_name or "User"
 
     user = get_user(user_id)
+    # Agar bilkul naya user hai toh trial_used = 0 ke saath save karo
     if not user:
         update_user(user_id, username, name, "None", "Inactive", "N/A", 0.0, 0)
 
@@ -211,17 +225,29 @@ def callback_query(call):
     name = call.from_user.first_name or "User"
     user = get_user(user_id)
 
+    # 1. DEMO / FREE TRIAL BUTTON (Fixed for First-Time Users!)
     if call.data == "demo":
-        if user and str(user[7]) == "1":
-            safe_answer(call.id, "⚠️ Aap apna Free Trial pehle hi use kar chuke hain! Kripya Paid Plan chunein.", show_alert=True)
+        # Check if user has genuinely used trial before (trial_used == 1)
+        already_used = False
+        if user is not None:
+            try:
+                if int(user[7]) == 1:
+                    already_used = True
+            except (ValueError, TypeError, IndexError):
+                already_used = False
+
+        if already_used:
+            safe_answer(call.id, "⚠️ Aap apna Free Trial pehle hi le chuke hain! Kripya Paid Plan chunein.", show_alert=True)
             return
 
-        safe_answer(call.id, "Free Trial Activated!")
+        # First time user: Give Demo Link Immediately!
+        safe_answer(call.id, "🎉 Free Trial Activated!")
         now = datetime.now(IST)
         expiry_dt = now + timedelta(minutes=2)
         raw_expiry = expiry_dt.timestamp()
         expiry_str = expiry_dt.strftime("%d %b %Y, %I:%M %p IST")
 
+        # Save user with trial_used = 1 so they can't take it a second time
         update_user(user_id, username, name, "Free Trial", "🆕 Free trial", expiry_str, raw_expiry, 1)
 
         markup = types.InlineKeyboardMarkup(row_width=1)
@@ -235,8 +261,9 @@ def callback_query(call):
             f"✅ Your free access is active until: {expiry_str}\n\n"
             "Tap the button below to enter the private channel."
         )
-        bot.send_message(message.chat.id, text, reply_markup=markup)
+        bot.send_message(call.message.chat.id, text, reply_markup=markup)
 
+    # 2. VIEW PAID PLANS
     elif call.data == "view_plans":
         safe_answer(call.id)
         markup = types.InlineKeyboardMarkup(row_width=1)
@@ -251,14 +278,17 @@ def callback_query(call):
         )
         bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
 
+    # 3. PLAN 299 QR
     elif call.data == "plan_299":
         safe_answer(call.id, "Generating ₹299 QR Code...")
         send_upi_qr(call.message.chat.id, 299, "30 Days Plan – ₹299")
 
+    # 4. PLAN 499 QR
     elif call.data == "plan_499":
         safe_answer(call.id, "Generating ₹499 QR Code...")
         send_upi_qr(call.message.chat.id, 499, "Lifetime Plan – ₹499")
 
+    # 5. MY ACCOUNT
     elif call.data == "my_account":
         safe_answer(call.id)
         if user and user[3] != "None":
@@ -287,6 +317,7 @@ def callback_query(call):
 
         bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
 
+    # 6. CONTACT SUPPORT
     elif call.data == "support":
         safe_answer(call.id)
         markup = types.InlineKeyboardMarkup(row_width=1)
@@ -301,6 +332,7 @@ def callback_query(call):
         )
         bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="Markdown")
 
+    # 7. SEND SCREENSHOT / SUPPORT
     elif call.data == "send_support" or call.data.startswith("send_ss_"):
         safe_answer(call.id)
         selected_amt = call.data.split("_")[-1] if call.data.startswith("send_ss_") else "Support"
@@ -311,6 +343,7 @@ def callback_query(call):
         )
         bot.register_next_step_handler(msg, process_support_message, selected_amt)
 
+    # 8. ADMIN APPROVE / REJECT
     elif call.data.startswith("adm_"):
         if user_id != ADMIN_ID:
             safe_answer(call.id, "⛔ Only Admin can use this button!", show_alert=True)
@@ -430,6 +463,6 @@ def process_support_message(message, selected_amt="Support"):
 
 # ================= RUN BOT & KEEP-ALIVE =================
 if __name__ == "__main__":
-    keep_alive()  # Flask server starts in background thread to satisfy Render port binding
-    print("Bot is running smoothly with Flask Keep-Alive & Auto-Ban...")
+    keep_alive()
+    print("Bot is running with Fixed First-Time Demo Link...")
     bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=10)
